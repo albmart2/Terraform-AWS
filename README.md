@@ -333,3 +333,340 @@ resource "aws_lambda_function" "procesador" {
 Esto le dice a Terraform: "aunque no lo veas en los atributos, crea primero la policy antes que la Lambda" (útil porque a veces AWS tarda en propagar permisos IAM).
 
 Internamente, todo esto se traduce en un **grafo dirigido acíclico (DAG)**, que puedes visualizar con ```terraform graph``` (lo verás en la Parte IV).
+
+## PARTE II — Instalación
+
+### 1. Instalar Terraform
+
+Terraform se distribuye como un **único binario ejecutable**, sin dependencias externas. Hay varias formas de instalarlo:
+
+#### Opción A: gestor de paquetes del sistema
+
+##### macOS (Homebrew):
+
+```bash
+brew tap hashicorp/tap
+brew install hashicorp/tap/terraform
+```
+
+##### Windows (Chocolatey):
+
+```powershell
+choco install terraform
+```
+
+##### Linux (Debian/Ubuntu):
+
+```bash
+wget -O- https://apt.releases.hashicorp.com/gpg | \
+  sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+  https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+  sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+sudo apt update && sudo apt install terraform
+```
+
+#### Opción B: binario manual
+
+Descargar el ```.zip``` correspondiente desde ```releases.hashicorp.com/terraform```, descomprimirlo y mover el binario a una carpeta del ```PATH```:
+
+```bash
+unzip terraform_1.9.0_linux_amd64.zip
+sudo mv terraform /usr/local/bin/
+```
+
+#### Opción C (recomendada para el curso): gestor de versiones ```tfenv```
+
+En proyectos reales es habitual necesitar **distintas versiones de Terraform** según el proyecto (uno usa 1.5, otro usa 1.9...). ```tfenv``` permite instalar varias versiones y cambiar entre ellas:
+
+```bash
+git clone https://github.com/tfutils/tfenv.git ~/.tfenv
+echo 'export PATH="$HOME/.tfenv/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+tfenv install 1.9.0
+tfenv use 1.9.0
+tfenv list          # ver versiones instaladas
+```
+
+Esto también permite fijar la versión por proyecto con un fichero ```.terraform-version``` en la raíz del repositorio, que ```tfenv``` detecta automáticamente.
+
+#### Verificar instalación
+
+```bash
+terraform -version
+```
+
+```
+Terraform v1.9.0
+on linux_amd64
+```
+
+### 2. Instalar AWS CLI
+
+El AWS CLI es la herramienta oficial de línea de comandos de Amazon. Aunque Terraform no la necesita internamente para funcionar, es imprescindible para:
+
+- Configurar credenciales que Terraform usará.
+- Inspeccionar recursos manualmente al depurar (aws ec2 describe-instances, etc.).
+- Ejecutar comandos puntuales fuera del ciclo de Terraform.
+
+#### Instalación (versión 2, la actual)
+
+##### macOS:
+
+```bash
+curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
+sudo installer -pkg AWSCLIV2.pkg -target /
+```
+
+##### Linux:
+
+```bash
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
+##### Windows
+
+Descargar e instalar el .msi desde la documentación oficial de AWS.
+
+#### Verificar instalación
+
+```bash
+aws --version
+```
+
+```
+aws-cli/2.17.0 Python/3.12.0 Linux/6.5.0 exe/x86_64.ubuntu.24
+```
+
+### 3. Configurar credenciales
+
+Terraform, a través del provider de AWS, necesita autenticarse. El provider busca credenciales en este orden de prioridad:
+
+
+Argumentos explícitos en el bloque provider "aws" {} (no recomendado para secretos).
+Variables de entorno.
+Ficheros de configuración/credenciales de AWS CLI (~/.aws/credentials, ~/.aws/config).
+Rol de IAM asociado a la instancia/entorno de ejecución (EC2, ECS, CodeBuild...).
+
+
+Opción A: aws configure (la más sencilla para empezar)
+
+bashaws configure
+
+AWS Access Key ID [None]: AKIAxxxxxxxxxxxxxxxx
+AWS Secret Access Key [None]: ****************************
+Default region name [None]: eu-west-1
+Default output format [None]: json
+
+Esto genera dos ficheros:
+
+ini# ~/.aws/credentials
+[default]
+aws_access_key_id = AKIAxxxxxxxxxxxxxxxx
+aws_secret_access_key = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+ini# ~/.aws/config
+[default]
+region = eu-west-1
+output = json
+
+Opción B: perfiles múltiples
+
+Si trabajas con varias cuentas AWS (personal, curso, empresa...), conviene usar perfiles nombrados:
+
+bashaws configure --profile curso-terraform
+
+ini# ~/.aws/credentials
+[curso-terraform]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+
+Y en Terraform:
+
+hclprovider "aws" {
+  region  = "eu-west-1"
+  profile = "curso-terraform"
+}
+
+O bien, sin tocar el código, mediante variable de entorno:
+
+bashexport AWS_PROFILE=curso-terraform
+
+Opción C: variables de entorno directas (útil en CI/CD)
+
+bashexport AWS_ACCESS_KEY_ID="AKIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_DEFAULT_REGION="eu-west-1"
+
+Esta opción se usa mucho en pipelines de CI/CD (Parte IX), donde estas variables se inyectan como secrets del propio sistema de CI, nunca escritas en el repositorio.
+
+Opción D: asumir un rol (assume role)
+
+En organizaciones con múltiples cuentas AWS, es habitual autenticarte en una cuenta "central" y luego asumir un rol en la cuenta destino:
+
+hclprovider "aws" {
+  region = "eu-west-1"
+
+  assume_role {
+    role_arn = "arn:aws:iam::123456789012:role/TerraformDeployRole"
+  }
+}
+
+Esto evita tener credenciales de larga duración por cada cuenta y sigue el principio de mínimo privilegio a nivel organizativo.
+
+Verificar que las credenciales funcionan
+
+bashaws sts get-caller-identity
+
+json{
+    "UserId": "AIDAxxxxxxxxxxxxxxxxx",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/tu-usuario"
+}
+
+Si este comando responde correctamente, Terraform también podrá autenticarse.
+
+
+4. IAM para Terraform
+
+Antes de lanzar tu primer terraform apply, necesitas un usuario o rol de IAM con los permisos adecuados. Hay dos enfoques:
+
+Enfoque rápido para aprender (no recomendado en producción)
+
+Adjuntar la policy gestionada AdministratorAccess a tu usuario de curso. Es la vía más simple para no bloquearte con permisos mientras aprendes, pero nunca se hace así en un entorno real.
+
+Enfoque de mínimo privilegio (el correcto en proyectos reales)
+
+Crear una policy que solo permita las acciones que Terraform necesita para los servicios que vas a gestionar. Ejemplo simplificado, permitiendo solo EC2 y S3:
+
+json{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:CreateTags",
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:PutBucketVersioning",
+        "s3:GetBucketVersioning"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+En un curso conviene empezar con permisos amplios sobre los servicios concretos que se van a usar (IAM, EC2, VPC, S3, RDS...) e ir restringiendo progresivamente a medida que entiendes qué usa realmente cada capítulo. Esto se retomará con más profundidad en la Parte X (Buenas prácticas → Seguridad).
+
+Usuario de IAM vs Rol de IAM
+
+
+Usuario: identidad con credenciales fijas (access key + secret key), pensada para personas o para ejecutar Terraform desde tu propio ordenador.
+Rol: identidad temporal, sin credenciales fijas, pensada para que la asuman servicios (como una instancia EC2 que ejecuta Terraform) o para el assume_role visto antes.
+
+
+Para este curso, lo más práctico es empezar con un usuario de IAM dedicado exclusivamente a Terraform (no tu usuario personal de AWS), para poder revocar sus credenciales fácilmente sin afectar a otras cosas.
+
+
+5. VSCode
+
+Visual Studio Code es el editor recomendado para este curso, por su combinación de ligereza y ecosistema de extensiones.
+
+Instalación
+
+
+macOS: brew install --cask visual-studio-code
+Windows/Linux: descargar el instalador desde code.visualstudio.com
+
+
+
+6. Extensiones
+
+Para trabajar cómodamente con Terraform en VSCode, instala:
+
+
+HashiCorp Terraform (hashicorp.terraform): la extensión oficial. Aporta:
+
+Resaltado de sintaxis HCL.
+Autocompletado de argumentos según el provider.
+Validación en tiempo real.
+Formato automático (equivalente a terraform fmt al guardar).
+
+
+
+AWS Toolkit (amazonwebservices.aws-toolkit-vscode): permite explorar recursos de AWS directamente desde el editor, útil para verificar visualmente lo que Terraform ha creado.
+YAML / Even Better TOML (opcionales): si en el curso más adelante tocas ficheros de CI/CD (GitHub Actions usa YAML), conviene tenerlas ya instaladas.
+
+
+Configuración recomendada (settings.json)
+
+json{
+  "[terraform]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "hashicorp.terraform"
+  },
+  "[terraform-vars]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "hashicorp.terraform"
+  }
+}
+
+Esto asegura que cada vez que guardes un fichero .tf, VSCode ejecute automáticamente el equivalente a terraform fmt, manteniendo el código siempre bien formateado sin esfuerzo manual.
+
+
+7. Formato del proyecto
+
+Antes de escribir la primera línea de HCL "de verdad" (Parte III), conviene fijar una estructura de carpetas y ficheros estándar. La convención más extendida es:
+
+mi-proyecto-terraform/
+├── main.tf          # recursos principales
+├── variables.tf     # declaración de variables de entrada
+├── outputs.tf       # valores de salida
+├── providers.tf     # configuración de terraform{} y provider{}
+├── terraform.tfvars # valores concretos de las variables (NO se sube a Git si tiene secretos)
+├── .gitignore
+└── modules/
+    ├── vpc/
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    └── ec2/
+        ├── main.tf
+        ├── variables.tf
+        └── outputs.tf
+
+Por qué se separan así los ficheros
+
+Terraform, técnicamente, no obliga a esta separación — podrías poner todo en un único fichero main.tf y funcionaría igual, porque Terraform carga y combina todos los ficheros .tf de un directorio como si fueran uno solo. La separación es una convención de legibilidad y mantenimiento:
+
+
+providers.tf: para saber de un vistazo con qué proveedores/versiones trabaja el proyecto.
+variables.tf: para ver de un vistazo qué "inputs" espera el proyecto, sin tener que leer toda la lógica.
+outputs.tf: qué expone este proyecto hacia fuera (por ejemplo, para que otro equipo consuma el ID de la VPC creada).
+main.tf: la lógica en sí — los recursos.
+
+
+.gitignore recomendado
+
+gitignore# Estado local y sus backups
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl  # opcional: algunos equipos SÍ lo versionan, ver nota abajo
+
+# Ficheros con variables sensibles
+*.tfvars
+!example.tfvars
+
+# Logs
+crash.log
+
+Nota sobre .terraform.lock.hcl: este fichero fija las versiones exactas de los providers usados. La recomendación oficial de HashiCorp es sí versionarlo en Git (no ignorarlo), para garantizar que todo el equipo use exactamente las mismas versiones de provider. Lo he incluido arriba como ejemplo de decisión a tomar conscientemente, no como regla fija.
