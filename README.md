@@ -445,106 +445,128 @@ aws-cli/2.17.0 Python/3.12.0 Linux/6.5.0 exe/x86_64.ubuntu.24
 
 ### 3. Configurar credenciales
 
-Terraform, a través del provider de AWS, necesita autenticarse. El provider busca credenciales en este orden de prioridad:
+Terraform, a través del provider de AWS, necesita autenticarse. El provider busca credenciales en este **orden de prioridad**:
 
+1. Argumentos explícitos en el bloque ```provider "aws" {}``` (no recomendado para secretos).
+2. Variables de entorno.
+3. Ficheros de configuración/credenciales de AWS CLI (```~/.aws/credentials```, ```~/.aws/config```).
+4. Rol de IAM asociado a la instancia/entorno de ejecución (EC2, ECS, CodeBuild...).
 
-Argumentos explícitos en el bloque provider "aws" {} (no recomendado para secretos).
-Variables de entorno.
-Ficheros de configuración/credenciales de AWS CLI (~/.aws/credentials, ~/.aws/config).
-Rol de IAM asociado a la instancia/entorno de ejecución (EC2, ECS, CodeBuild...).
+#### Opción A: ```aws configure``` (la más sencilla para empezar)
 
+```bash
+aws configure
+```
 
-Opción A: aws configure (la más sencilla para empezar)
-
-bashaws configure
-
+```
 AWS Access Key ID [None]: AKIAxxxxxxxxxxxxxxxx
 AWS Secret Access Key [None]: ****************************
 Default region name [None]: eu-west-1
 Default output format [None]: json
+```
 
 Esto genera dos ficheros:
 
-ini# ~/.aws/credentials
+```ini
+# ~/.aws/credentials
 [default]
 aws_access_key_id = AKIAxxxxxxxxxxxxxxxx
 aws_secret_access_key = xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
 
-ini# ~/.aws/config
+```ini
+# ~/.aws/config
 [default]
 region = eu-west-1
 output = json
+```
 
-Opción B: perfiles múltiples
+#### Opción B: perfiles múltiples
 
 Si trabajas con varias cuentas AWS (personal, curso, empresa...), conviene usar perfiles nombrados:
 
-bashaws configure --profile curso-terraform
+```bash
+aws configure --profile curso-terraform
+```
 
-ini# ~/.aws/credentials
+```ini
+# ~/.aws/credentials
 [curso-terraform]
 aws_access_key_id = AKIA...
 aws_secret_access_key = ...
+```
 
 Y en Terraform:
 
-hclprovider "aws" {
+```hcl
+provider "aws" {
   region  = "eu-west-1"
   profile = "curso-terraform"
 }
+```
 
 O bien, sin tocar el código, mediante variable de entorno:
 
-bashexport AWS_PROFILE=curso-terraform
+```bash
+export AWS_PROFILE=curso-terraform
+```
 
-Opción C: variables de entorno directas (útil en CI/CD)
+#### Opción C: variables de entorno directas (útil en CI/CD)
 
-bashexport AWS_ACCESS_KEY_ID="AKIA..."
+```bash
+export AWS_ACCESS_KEY_ID="AKIA..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_DEFAULT_REGION="eu-west-1"
+```
 
 Esta opción se usa mucho en pipelines de CI/CD (Parte IX), donde estas variables se inyectan como secrets del propio sistema de CI, nunca escritas en el repositorio.
 
-Opción D: asumir un rol (assume role)
+#### Opción D: asumir un rol (assume role)
 
-En organizaciones con múltiples cuentas AWS, es habitual autenticarte en una cuenta "central" y luego asumir un rol en la cuenta destino:
+En organizaciones con múltiples cuentas AWS, es habitual autenticarte en una cuenta "central" y luego **asumir un rol** en la cuenta destino:
 
-hclprovider "aws" {
+```hcl
+provider "aws" {
   region = "eu-west-1"
 
   assume_role {
     role_arn = "arn:aws:iam::123456789012:role/TerraformDeployRole"
   }
 }
+```
 
 Esto evita tener credenciales de larga duración por cada cuenta y sigue el principio de mínimo privilegio a nivel organizativo.
 
-Verificar que las credenciales funcionan
+#### Verificar que las credenciales funcionan
 
-bashaws sts get-caller-identity
+```bash
+aws sts get-caller-identity
+```
 
-json{
+```json
+{
     "UserId": "AIDAxxxxxxxxxxxxxxxxx",
     "Account": "123456789012",
     "Arn": "arn:aws:iam::123456789012:user/tu-usuario"
 }
+```
 
 Si este comando responde correctamente, Terraform también podrá autenticarse.
 
+### 4. IAM para Terraform
 
-4. IAM para Terraform
+Antes de lanzar tu primer ```terraform apply```, necesitas un usuario o rol de IAM con los **permisos adecuados**. Hay dos enfoques:
 
-Antes de lanzar tu primer terraform apply, necesitas un usuario o rol de IAM con los permisos adecuados. Hay dos enfoques:
+#### Enfoque rápido para aprender (no recomendado en producción)
 
-Enfoque rápido para aprender (no recomendado en producción)
+Adjuntar la policy gestionada ```AdministratorAccess``` a tu usuario de curso. Es la vía más simple para no bloquearte con permisos mientras aprendes, pero **nunca se hace así en un entorno real**.
 
-Adjuntar la policy gestionada AdministratorAccess a tu usuario de curso. Es la vía más simple para no bloquearte con permisos mientras aprendes, pero nunca se hace así en un entorno real.
-
-Enfoque de mínimo privilegio (el correcto en proyectos reales)
+#### Enfoque de mínimo privilegio (el correcto en proyectos reales)
 
 Crear una policy que solo permita las acciones que Terraform necesita para los servicios que vas a gestionar. Ejemplo simplificado, permitiendo solo EC2 y S3:
 
-json{
+```json
+{
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -563,52 +585,44 @@ json{
     }
   ]
 }
+```
 
-En un curso conviene empezar con permisos amplios sobre los servicios concretos que se van a usar (IAM, EC2, VPC, S3, RDS...) e ir restringiendo progresivamente a medida que entiendes qué usa realmente cada capítulo. Esto se retomará con más profundidad en la Parte X (Buenas prácticas → Seguridad).
+En un curso conviene empezar con permisos amplios sobre los servicios concretos que se van a usar (IAM, EC2, VPC, S3, RDS...) e ir **restringiendo progresivamente** a medida que entiendes qué usa realmente cada capítulo. Esto se retomará con más profundidad en la Parte X (Buenas prácticas → Seguridad).
 
-Usuario de IAM vs Rol de IAM
+#### Usuario de IAM vs Rol de IAM
 
+- **Usuario**: identidad con credenciales fijas (access key + secret key), pensada para personas o para ejecutar Terraform desde tu propio ordenador.
+- **Rol**: identidad temporal, sin credenciales fijas, pensada para que la asuman servicios (como una instancia EC2 que ejecuta Terraform) o para el ```assume_role``` visto antes.
 
-Usuario: identidad con credenciales fijas (access key + secret key), pensada para personas o para ejecutar Terraform desde tu propio ordenador.
-Rol: identidad temporal, sin credenciales fijas, pensada para que la asuman servicios (como una instancia EC2 que ejecuta Terraform) o para el assume_role visto antes.
+Para este curso, lo más práctico es empezar con un **usuario de IAM dedicado exclusivamente a Terraform** (no tu usuario personal de AWS), para poder revocar sus credenciales fácilmente sin afectar a otras cosas.
 
-
-Para este curso, lo más práctico es empezar con un usuario de IAM dedicado exclusivamente a Terraform (no tu usuario personal de AWS), para poder revocar sus credenciales fácilmente sin afectar a otras cosas.
-
-
-5. VSCode
+### 5. VSCode
 
 Visual Studio Code es el editor recomendado para este curso, por su combinación de ligereza y ecosistema de extensiones.
 
-Instalación
+#### Instalación
 
+- **macOS**: ```brew install --cask visual-studio-code```.
+- **Windows/Linux**: descargar el instalador desde ```code.visualstudio.com```.
 
-macOS: brew install --cask visual-studio-code
-Windows/Linux: descargar el instalador desde code.visualstudio.com
-
-
-
-6. Extensiones
+### 6. Extensiones
 
 Para trabajar cómodamente con Terraform en VSCode, instala:
 
+1. **HashiCorp Terraform** (```hashicorp.terraform```): la extensión oficial. Aporta:
 
-HashiCorp Terraform (hashicorp.terraform): la extensión oficial. Aporta:
+    - Resaltado de sintaxis HCL.
+    - Autocompletado de argumentos según el provider.
+    - Validación en tiempo real.
+    - Formato automático (equivalente a ```terraform fmt``` al guardar).
 
-Resaltado de sintaxis HCL.
-Autocompletado de argumentos según el provider.
-Validación en tiempo real.
-Formato automático (equivalente a terraform fmt al guardar).
+2. **AWS Toolkit** (```amazonwebservices.aws-toolkit-vscode```): permite explorar recursos de AWS directamente desde el editor, útil para verificar visualmente lo que Terraform ha creado.
+3. **YAML / Even Better TOML** (opcionales): si en el curso más adelante tocas ficheros de CI/CD (GitHub Actions usa YAML), conviene tenerlas ya instaladas.
 
+#### Configuración recomendada (```settings.json```)
 
-
-AWS Toolkit (amazonwebservices.aws-toolkit-vscode): permite explorar recursos de AWS directamente desde el editor, útil para verificar visualmente lo que Terraform ha creado.
-YAML / Even Better TOML (opcionales): si en el curso más adelante tocas ficheros de CI/CD (GitHub Actions usa YAML), conviene tenerlas ya instaladas.
-
-
-Configuración recomendada (settings.json)
-
-json{
+```json
+{
   "[terraform]": {
     "editor.formatOnSave": true,
     "editor.defaultFormatter": "hashicorp.terraform"
@@ -618,14 +632,15 @@ json{
     "editor.defaultFormatter": "hashicorp.terraform"
   }
 }
+```
 
-Esto asegura que cada vez que guardes un fichero .tf, VSCode ejecute automáticamente el equivalente a terraform fmt, manteniendo el código siempre bien formateado sin esfuerzo manual.
+Esto asegura que cada vez que guardes un fichero ```.tf```, VSCode ejecute automáticamente el equivalente a ```terraform fmt```, manteniendo el código siempre bien formateado sin esfuerzo manual.
 
-
-7. Formato del proyecto
+### 7. Formato del proyecto
 
 Antes de escribir la primera línea de HCL "de verdad" (Parte III), conviene fijar una estructura de carpetas y ficheros estándar. La convención más extendida es:
 
+```
 mi-proyecto-terraform/
 ├── main.tf          # recursos principales
 ├── variables.tf     # declaración de variables de entrada
@@ -642,21 +657,21 @@ mi-proyecto-terraform/
         ├── main.tf
         ├── variables.tf
         └── outputs.tf
+```
 
-Por qué se separan así los ficheros
+#### Por qué se separan así los ficheros
 
-Terraform, técnicamente, no obliga a esta separación — podrías poner todo en un único fichero main.tf y funcionaría igual, porque Terraform carga y combina todos los ficheros .tf de un directorio como si fueran uno solo. La separación es una convención de legibilidad y mantenimiento:
+Terraform, técnicamente, no obliga a esta separación — **podrías poner todo en un único fichero ```main.tf```** y funcionaría igual, porque Terraform carga y combina todos los ficheros ```.tf``` de un directorio como si fueran uno solo. La separación es una **convención de legibilidad y mantenimiento**:
 
+- ```providers.tf```: para saber de un vistazo con qué proveedores/versiones trabaja el proyecto.
+- ```variables.tf```: para ver de un vistazo qué "inputs" espera el proyecto, sin tener que leer toda la lógica.
+- ```outputs.tf```: qué expone este proyecto hacia fuera (por ejemplo, para que otro equipo consuma el ID de la VPC creada).
+- ```main.tf```: la lógica en sí — los recursos.
 
-providers.tf: para saber de un vistazo con qué proveedores/versiones trabaja el proyecto.
-variables.tf: para ver de un vistazo qué "inputs" espera el proyecto, sin tener que leer toda la lógica.
-outputs.tf: qué expone este proyecto hacia fuera (por ejemplo, para que otro equipo consuma el ID de la VPC creada).
-main.tf: la lógica en sí — los recursos.
+#### ```.gitignore``` recomendado
 
-
-.gitignore recomendado
-
-gitignore# Estado local y sus backups
+```gitignore
+# Estado local y sus backups
 *.tfstate
 *.tfstate.*
 .terraform/
@@ -668,5 +683,6 @@ gitignore# Estado local y sus backups
 
 # Logs
 crash.log
+```
 
-Nota sobre .terraform.lock.hcl: este fichero fija las versiones exactas de los providers usados. La recomendación oficial de HashiCorp es sí versionarlo en Git (no ignorarlo), para garantizar que todo el equipo use exactamente las mismas versiones de provider. Lo he incluido arriba como ejemplo de decisión a tomar conscientemente, no como regla fija.
+**Nota sobre ```.terraform.lock.hcl```**: este fichero fija las versiones exactas de los providers usados. La recomendación oficial de HashiCorp es **sí versionarlo** en Git (no ignorarlo), para garantizar que todo el equipo use exactamente las mismas versiones de provider. Lo he incluido arriba como ejemplo de decisión a tomar conscientemente, no como regla fija.
