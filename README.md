@@ -686,3 +686,517 @@ crash.log
 ```
 
 **Nota sobre ```.terraform.lock.hcl```**: este fichero fija las versiones exactas de los providers usados. La recomendación oficial de HashiCorp es **sí versionarlo** en Git (no ignorarlo), para garantizar que todo el equipo use exactamente las mismas versiones de provider. Lo he incluido arriba como ejemplo de decisión a tomar conscientemente, no como regla fija.
+
+## PARTE III — Sintaxis HCL (desde cero)
+
+HCL (HashiCorp Configuration Language) es el lenguaje en el que se escribe Terraform. Es un lenguaje **declarativo**, pensado para ser legible tanto por humanos como parseable por máquinas. En esta parte lo veremos íntegramente, sin asumir conocimientos previos de programación.
+
+### 1. Variables
+
+Una ```variable``` declara un **parámetro de entrada** para tu configuración, para no hardcodear valores.
+
+```hcl
+variable "region" {
+  description = "Región de AWS donde desplegar"
+  type        = string
+  default     = "eu-west-1"
+}
+```
+
+Se usa en el resto del código con ```var.<nombre>```:
+
+```hcl
+provider "aws" {
+  region = var.region
+}
+```
+
+Formas de asignar un valor a una variable (por orden de prioridad, de menor a mayor):
+
+1. El ```default``` del propio bloque ```variable```.
+2. Fichero ```terraform.tfvars``` (se carga automáticamente).
+3. Fichero ```*.auto.tfvars``` (también automático).
+4. Flag ```-var="region=us-east-1"``` en la CLI.
+5. Flag ```-var-file="produccion.tfvars"```.
+6. Variable de entorno ```TF_VAR_region```.
+
+```bash
+# terraform.tfvars
+region = "us-east-1"
+```
+
+```bash
+export TF_VAR_region="us-east-1"
+terraform apply -var="region=eu-central-1"  # esta gana sobre todo lo anterior
+```
+
+### 2. Tipos
+
+HCL tiene un sistema de tipos que puedes declarar explícitamente en cada variable:
+
+```hcl
+variable "puerto" {
+  type = number
+}
+
+variable "activo" {
+  type = bool
+}
+
+variable "nombres" {
+  type = list(string)
+}
+```
+
+Tipos primitivos: ```string```, ```number```, ```bool```. Tipos de colección: ```list()```, ```set()```, ```map()```, ```object()```, ```tuple()```.
+
+Si no declaras ```type```, Terraform intenta inferirlo, pero **declararlo siempre es una buena práctica**: detecta errores antes de aplicar, y sirve de documentación.
+
+### 3. Strings
+
+Los strings van entre comillas dobles, y soportan **interpolación**:
+
+```hcllocals {
+  entor
+no = "produccion"
+  nombre_bucket = "app-${local.entorno}-logs"
+}
+```
+
+Resultado: ```"app-produccion-logs"```.
+
+#### Heredocs (texto multilínea)
+
+Útiles, por ejemplo, para scripts de ```user_data```:
+
+```hcl
+locals {
+  script_inicio = <<-EOF
+    #!/bin/bash
+    yum update -y
+    yum install -y nginx
+    systemctl start nginx
+  EOF
+}
+```
+
+El ```-``` tras ```<<``` (es decir, ```<<-EOF```) permite indentar el heredoc sin que esa indentación se incluya en el resultado final.
+
+#### Funciones de string comunes
+
+```hcl
+upper("hola")            # "HOLA"
+lower("HOLA")             # "hola"
+trimspace("  hola  ")     # "hola"
+substr("terraform", 0, 4) # "terr"
+format("app-%s-%03d", "web", 7)  # "app-web-007"
+```
+
+### 4. Numbers
+
+Enteros y decimales, sin distinción de tipo (a diferencia de otros lenguajes):
+
+```hcl
+variable "cantidad_instancias" {
+  type    = number
+  default = 3
+}
+
+locals {
+  total_gb = 100 * 1.5   # 150
+  mitad    = 10 / 3      # 3.3333333333
+}
+```
+
+Operadores aritméticos disponibles: ```+```, ```-```, ```*```, ```/```, ```%``` (módulo).
+
+### 5. Maps
+
+Colecciones **clave-valor**, todas las claves del mismo tipo (normalmente string) y todos los valores del mismo tipo:
+
+```hcl
+variable "tipo_instancia_por_entorno" {
+  type = map(string)
+  default = {
+    dev  = "t3.micro"
+    test = "t3.small"
+    prod = "t3.large"
+  }
+}
+```
+
+Acceso a un valor:
+
+```hcl
+resource "aws_instance" "app" {
+  instance_type = var.tipo_instancia_por_entorno["prod"]
+  # o bien:
+  # instance_type = lookup(var.tipo_instancia_por_entorno, "prod", "t3.micro")
+}
+```
+
+```lookup()``` permite dar un valor por defecto si la clave no existe, evitando errores.
+
+### 6. Lists
+
+Colecciones **ordenadas** de elementos del mismo tipo:
+
+```hcl
+variable "zonas_disponibilidad" {
+  type    = list(string)
+  default = ["eu-west-1a", "eu-west-1b", "eu-west-1c"]
+}
+```
+
+Acceso por índice (empezando en 0):
+
+```hcl
+locals {
+  primera_zona = var.zonas_disponibilidad[0]  # "eu-west-1a"
+}
+```
+
+Funciones útiles sobre listas:
+
+```hcl
+length(var.zonas_disponibilidad)      # 3
+element(var.zonas_disponibilidad, 1)  # "eu-west-1b"
+contains(var.zonas_disponibilidad, "eu-west-1a")  # true
+```
+
+### 7. Tuples
+
+Como una lista, pero **los tipos de cada posición pueden ser distintos** (y son fijos en número y tipo):
+
+```hcl
+locals {
+  registro = ["servidor-web", 3, true]  # tuple(string, number, bool)
+}
+```
+
+En la práctica, las tuples aparecen sobre todo de forma implícita (Terraform las usa internamente), y rara vez las declaras explícitamente en variables de un proyecto normal — es más común usar ```object``` cuando necesitas datos heterogéneos con nombre.
+
+### 8. Objects
+
+Como un map, pero con **atributos con nombre y tipos definidos**, similar a un "registro" o "struct":
+
+```hcl
+variable "config_servidor" {
+  type = object({
+    nombre        = string
+    cpu           = number
+    tiene_backup  = bool
+  })
+
+  default = {
+    nombre       = "web-01"
+    cpu          = 2
+    tiene_backup = true
+  }
+}
+```
+
+Acceso:
+
+```hcl
+locals {
+  nombre_servidor = var.config_servidor.nombre
+}
+```
+
+Los objects son especialmente útiles para agrupar configuración relacionada y evitar tener 10 variables sueltas.
+
+### 9. Sets
+
+Como una lista, pero **sin duplicados y sin orden garantizado**. Se usan sobre todo junto a ```for_each```:
+
+```hcl
+variable "puertos_permitidos" {
+  type    = set(number)
+  default = [22, 80, 443]
+}
+```
+
+Diferencia práctica con ```list```: si intentas añadir un valor duplicado a un ```set```, Terraform lo ignora silenciosamente (no da error, simplemente no habrá duplicado).
+
+### 10. Operadores
+
+#### Aritméticos
+
+```+```, ```-```, ```*```, ```/```, ```%```.
+
+#### Comparación
+
+```==```, ```!=```, ```<```, ```>```, ```<=```, ```>=```.
+
+#### Lógicos
+
+```&&``` (and), ```||``` (or), ```!``` (not).
+
+```hcl
+locals {
+  es_produccion = var.entorno == "prod"
+  necesita_backup = var.es_produccion && var.tiene_datos_criticos
+}
+```
+
+### 11. Funciones
+
+HCL no permite definir funciones propias (no hay ```function miFuncion()```), pero incluye un catálogo grande de **funciones integradas**. Algunas de las más usadas en el día a día:
+
+```hcl
+merge({a = 1}, {b = 2})              # {a = 1, b = 2}
+concat(["a", "b"], ["c"])            # ["a", "b", "c"]
+join(",", ["a", "b", "c"])           # "a,b,c"
+split(",", "a,b,c")                  # ["a", "b", "c"]
+coalesce(null, "", "valor")          # "valor" (primer valor no nulo/no vacío)
+cidrsubnet("10.0.0.0/16", 8, 1)      # "10.0.1.0/24"
+timestamp()                          # fecha/hora actual en formato RFC 3339
+```
+
+```cidrsubnet``` es especialmente importante en la Parte V: permite calcular subredes automáticamente a partir de un bloque CIDR mayor, sin tener que calcularlas a mano.
+
+### 12. Condicionales
+
+HCL solo tiene **una** forma de condicional: el operador ternario.
+
+```hcl
+resource "aws_instance" "app" {
+  instance_type = var.entorno == "prod" ? "t3.large" : "t3.micro"
+}
+```
+
+Se lee: "si ```var.entorno == 'prod'```, usa ```t3.large```; si no, usa ```t3.micro```".
+
+Se pueden anidar, aunque a partir de 2 niveles conviene extraerlo a un ```local``` para mantener legibilidad:
+
+```hcl
+locals {
+  tipo_instancia = var.entorno == "prod" ? "t3.large" : (
+    var.entorno == "test" ? "t3.small" : "t3.micro"
+  )
+}
+```
+
+### 13. Loops
+
+HCL no tiene bucles imperativos (```for```, ```while``` tradicionales). En su lugar, existen dos mecanismos para **repetir la creación de recursos** (```for_each``` y ```count```), y una construcción de **expresión** para transformar colecciones (```for ... in ...```), que veremos en el punto 18.
+
+### 14. for_each
+
+Crea una instancia del recurso **por cada elemento de un map o set**, usando la clave como identificador:
+
+```hcl
+variable "buckets" {
+  type    = set(string)
+  default = ["logs", "backups", "assets"]
+}
+
+resource "aws_s3_bucket" "todos" {
+  for_each = var.buckets
+  bucket   = "mi-app-${each.value}"
+}
+```
+
+Dentro del bloque, ```each.key``` y ```each.value``` están disponibles (en un ```set```, ambos son iguales; en un ```map```, ```each.key``` es la clave y ```each.value``` es el valor).
+
+```hcl
+variable "instancias" {
+  type = map(object({
+    tipo = string
+  }))
+  default = {
+    web = { tipo = "t3.micro" }
+    api = { tipo = "t3.small" }
+  }
+}
+
+resource "aws_instance" "app" {
+  for_each      = var.instancias
+  ami           = "ami-0c55b159cbfafe1f0"
+  instance_type = each.value.tipo
+
+  tags = {
+    Name = "servidor-${each.key}"
+  }
+}
+```
+
+Referenciar un recurso creado con ```for_each``` desde otro sitio requiere la clave:
+
+```hcl
+output "ip_web" {
+  value = aws_instance.app["web"].public_ip
+}
+```
+
+**Ventaja clave sobre ```count```**: si eliminas ```"api"``` del map, Terraform sabe exactamente que debe destruir solo esa instancia, sin tocar ```"web"```. Con ```count```, como verás abajo, esto no siempre es así.
+
+### 15. count
+
+Crea **N copias** de un recurso, identificadas por índice numérico (0, 1, 2...):
+
+```hcl
+resource "aws_instance" "worker" {
+  count         = 3
+  ami           = "ami-0c55b159cbfafe1f0"
+  instance_type = "t3.micro"
+
+  tags = {
+    Name = "worker-${count.index}"
+  }
+}
+```
+
+Esto crea ```worker-0```, ```worker-1```, ```worker-2```. Se referencian así:
+
+```hcl
+output "ip_worker_0" {
+  value = aws_instance.worker[0].public_ip
+}
+```
+
+#### El problema clásico de ```count```
+
+Si tienes 3 instancias (índices 0, 1, 2) y eliminas la del medio de tu lista de origen, Terraform **reindexa todo**, y puede destruir y recrear instancias que en realidad no debían cambiar, simplemente porque su índice cambió. Por eso, la recomendación general es:
+
+- Usa ```count``` cuando los elementos son genuinamente intercambiables (N réplicas idénticas de lo mismo).
+- Usa ```for_each``` cuando cada elemento tiene una identidad propia (nombres, distintas configuraciones), para evitar el problema de reindexado.
+
+### 16. Dynamic Blocks
+
+Sirven para generar **bloques anidados repetidos** dentro de un recurso — algo que ni ```count``` ni ```for_each``` (a nivel de recurso) pueden hacer, porque estos operan sobre el recurso completo, no sobre un bloque interno suyo.
+
+Ejemplo clásico: un Security Group con un número variable de reglas de entrada.
+
+```hcl
+variable "reglas_entrada" {
+  type = list(object({
+    puerto      = number
+    protocolo   = string
+    cidr_origen = string
+  }))
+  default = [
+    { puerto = 22, protocolo = "tcp", cidr_origen = "0.0.0.0/0" },
+    { puerto = 80, protocolo = "tcp", cidr_origen = "0.0.0.0/0" },
+    { puerto = 443, protocolo = "tcp", cidr_origen = "0.0.0.0/0" },
+  ]
+}
+
+resource "aws_security_group" "web" {
+  name   = "sg-web"
+  vpc_id = aws_vpc.principal.id
+
+  dynamic "ingress" {
+    for_each = var.reglas_entrada
+    content {
+      from_port   = ingress.value.puerto
+      to_port     = ingress.value.puerto
+      protocol    = ingress.value.protocolo
+      cidr_blocks = [ingress.value.cidr_origen]
+    }
+  }
+}
+```
+
+Esto genera un bloque ```ingress { ... }``` por cada elemento de ```var.reglas_entrada```, sin tener que escribir cada regla a mano ni limitar el número de reglas de antemano.
+
+### 17. Expressions
+
+En HCL, casi todo lo que va a la derecha de un ```=``` es una **expresión**: una referencia, una operación, una llamada a función, un literal... Algunas construcciones destacadas:
+
+#### Splat expressions (```[*]```)
+
+Extraen un atributo de **todos** los elementos generados por un ```for_each``` o ```count``` a la vez:
+
+```hcl
+output "ips_publicas" {
+  value = aws_instance.app[*].public_ip  # con count
+}
+```
+
+Con ```for_each```, el equivalente es usar ```values()```:
+
+```hcl
+output "ips_publicas" {
+  value = values(aws_instance.app)[*].public_ip
+}
+```
+
+#### Comprensiones ```for ... in ...```
+
+Transforman una colección en otra, de forma similar a un "list comprehension" de Python:
+
+```hcl
+locals {
+  nombres_mayusculas = [for n in var.nombres : upper(n)]
+
+  # con filtro:
+  solo_produccion = [for e in var.entornos : e if e == "prod"]
+
+  # generando un map:
+  tipo_por_nombre = {for k, v in var.instancias : k => v.tipo}
+}
+```
+
+### 18. Null
+
+```null``` representa la **ausencia de valor**. Se usa a menudo para indicar "usa el comportamiento por defecto de AWS" en lugar de forzar un valor concreto:
+
+```hcl
+resource "aws_instance" "app" {
+  ami                    = "ami-0c55b159cbfafe1f0"
+  instance_type          = "t3.micro"
+  subnet_id              = var.usar_subnet_default ? null : aws_subnet.privada.id
+}
+```
+
+Si una variable opcional no recibe valor y su ```default``` es ```null```, Terraform generalmente delega en el valor por defecto que la propia API de AWS aplicaría.
+
+### 19. Sensitive
+
+Marca variables u outputs para que Terraform **oculte su valor** en la salida de ```plan```/```apply``` (aunque sigue almacenándose en el estado, sin cifrar por defecto — de ahí la importancia de proteger el estado, Parte VI).
+
+```hcl
+variable "password_db" {
+  type      = string
+  sensitive = true
+}
+
+output "connection_string" {
+  value     = "postgres://admin:${var.password_db}@${aws_db_instance.principal.endpoint}"
+  sensitive = true
+}
+```
+
+Al ejecutar ```terraform apply```, en lugar de mostrar el valor real, la CLI muestra:
+
+```
++ connection_string = (sensitive value)
+```
+
+### 20. Validation
+
+Permite añadir **reglas de validación personalizadas** dentro de una variable, para detectar errores de entrada antes de intentar aplicar nada:
+
+```hcl
+variable "cidr_vpc" {
+  type = string
+
+  validation {
+    condition     = can(cidrhost(var.cidr_vpc, 0))
+    error_message = "El valor de cidr_vpc debe ser un bloque CIDR válido, por ejemplo 10.0.0.0/16."
+  }
+}
+
+variable "entorno" {
+  type = string
+
+  validation {
+    condition     = contains(["dev", "test", "prod"], var.entorno)
+    error_message = "El entorno debe ser uno de: dev, test, prod."
+  }
+}
+```
+
+La función ```can()``` es especialmente útil aquí: intenta evaluar una expresión y devuelve ```true```/```false``` según si lanza error o no, en lugar de propagar el error — ideal para validar formatos.
