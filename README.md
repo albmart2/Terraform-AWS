@@ -1200,3 +1200,432 @@ variable "entorno" {
 ```
 
 La función ```can()``` es especialmente útil aquí: intenta evaluar una expresión y devuelve ```true```/```false``` según si lanza error o no, en lugar de propagar el error — ideal para validar formatos.
+
+## PARTE IV — Terraform CLI (todos los comandos y parámetros)
+
+La CLI de Terraform es la interfaz principal con la que interactúas día a día. En esta parte se explica cada comando en profundidad, junto con sus parámetros más relevantes.
+
+### 1. terraform init
+
+Inicializa un directorio de trabajo. Es **siempre el primer comando** que se ejecuta en un proyecto nuevo, o tras clonar uno existente.
+
+```bash
+terraform init
+```
+
+Qué hace exactamente:
+
+1. Lee el bloque ```required_providers``` y descarga los plugins de provider necesarios (los guarda en ```.terraform/providers/```).
+2. Configura el **backend** (dónde se guardará el estado — local por defecto, o remoto si está declarado).
+3. Descarga los **módulos** referenciados (propios o de un registro).
+4. Genera/actualiza el fichero ```.terraform.lock.hcl```, que fija las versiones exactas de los providers.
+
+#### Parámetros más usados
+
+```bash
+terraform init -upgrade
+```
+
+Fuerza a buscar versiones más nuevas de providers y módulos, en lugar de respetar el lock file existente.
+
+```bash
+terraform init -reconfigure
+```
+
+Ignora la configuración de backend existente y la reconfigura desde cero (útil si cambias de backend, por ejemplo de local a S3).
+
+```bash
+terraform init -migrate-state
+```
+
+Como ```-reconfigure```, pero además **intenta migrar** el estado existente al nuevo backend, en lugar de empezar de cero.
+
+```bash
+terraform init -backend-config="bucket=mi-bucket-estado"
+```
+
+Permite pasar valores de configuración del backend desde la línea de comandos (útil en CI/CD, para no hardcodear el nombre del bucket en el código si cambia por entorno).
+
+```bash
+terraform init -input=false
+```
+
+Evita que Terraform pregunte de forma interactiva por valores que falten — imprescindible en pipelines automatizados.
+
+### 2. terraform validate
+
+Comprueba que la configuración es **sintácticamente correcta y coherente internamente** (tipos, referencias existentes...), **sin conectarse a AWS**.
+
+```bash
+terraform validate
+```
+
+Salida en caso de éxito:
+
+```
+Success! The configuration is valid.
+```
+
+Salida en caso de error:
+
+```
+Error: Reference to undeclared resource
+
+  on main.tf line 12, in resource "aws_instance" "app":
+  12:   subnet_id = aws_subnet.publica.id
+
+A resource "aws_subnet" "publica" has not been declared.
+```
+
+Es el primer paso lógico de cualquier pipeline de CI (Parte VIII/IX): si ```validate``` falla, ni siquiera tiene sentido intentar un ```plan```.
+
+```bash
+terraform validate -json
+```
+
+Salida en formato JSON, pensada para ser consumida por otras herramientas (linters, pipelines).
+
+### 3. terraform fmt
+
+Reformatea automáticamente el código según el estilo canónico de HCL (indentación, alineación de ```=```, etc.).
+
+```bash
+terraform fmt
+```
+
+Parámetros:
+
+```bash
+terraform fmt -recursive
+```
+
+Aplica el formato a todos los subdirectorios (útil si tienes módulos locales en carpetas).
+
+```bash
+terraform fmt -check
+```
+
+No modifica nada, solo **comprueba** si algo estaría mal formateado y devuelve un código de salida distinto de 0 si es así. Se usa mucho en CI, como "gate" antes de permitir un merge.
+
+```bash
+terraform fmt -diff
+```
+
+Muestra el diff de qué cambiaría, sin aplicarlo.
+
+### 4. terraform plan
+
+Calcula qué cambios se aplicarían, **sin ejecutarlos**. Es el comando que más se usa en el día a día.
+
+```bash
+terraform plan
+```
+
+La salida usa un sistema de símbolos:
+
+```
+  + crear
+  - destruir
+  ~ modificar in-place
+-/+ destruir y recrear
+```
+
+Ejemplo de salida:
+
+```
+Terraform will perform the following actions:
+
+  # aws_instance.web will be created
+  + resource "aws_instance" "web" {
+      + ami           = "ami-0c55b159cbfafe1f0"
+      + instance_type = "t3.micro"
+      + id            = (known after apply)
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+#### Parámetros más usados
+
+bashterraform plan -out=plan.tfplan
+
+Guarda el plan calculado en un fichero binario, para poder aplicarlo **exactamente** más tarde con ```terraform apply plan.tfplan``` — evita el riesgo de que algo cambie entre el ```plan``` y el ```apply``` (muy usado en CI/CD: un pipeline hace ```plan```, un humano lo revisa, y solo entonces se aplica ese plan exacto).
+
+```bash
+terraform plan -var="region=us-east-1"
+```
+
+Pasa una variable puntual desde la CLI.
+
+```bash
+terraform plan -var-file="produccion.tfvars"
+```
+
+Usa un fichero de variables concreto (útil para tener ```dev.tfvars```, ```produccion.tfvars```, etc.).
+
+```bash
+terraform plan -target=aws_instance.web
+```
+
+Limita el plan a un recurso concreto (y sus dependencias). **Uso ocasional**/**depuración**, no como práctica habitual, porque puede ocultar otros cambios pendientes.
+
+```bash
+terraform plan -destroy
+```
+
+Muestra qué se destruiría, sin ejecutarlo (equivalente a previsualizar un ```destroy```).
+
+```bash
+terraform plan -refresh=false
+```
+
+No sincroniza el estado contra la infraestructura real antes de calcular el plan (más rápido, pero puede dar un plan desactualizado si algo cambió fuera de Terraform).
+
+### 5. terraform apply
+
+Ejecuta los cambios, ya sea recalculando el plan en el momento o aplicando uno guardado previamente.
+
+```bash
+terraform apply
+```
+
+Calcula el plan, lo muestra, y pide confirmación explícita escribiendo ```yes```.
+
+```bash
+terraform apply plan.tfplan
+```
+
+Aplica un plan ya guardado con ```terraform plan -out=plan.tfplan```, **sin volver a preguntar** (porque ya fue revisado).
+
+#### Parámetros más usados
+
+```bash
+terraform apply -auto-approve
+```
+
+Omite la confirmación interactiva. Imprescindible en pipelines de CI/CD, pero se usa con cautela en local (fácil de aplicar algo por error).
+
+```bash
+terraform apply -var-file="produccion.tfvars"
+```
+
+Igual que en ```plan```.
+
+```bash
+terraform apply -parallelism=5
+```
+
+Limita cuántas operaciones puede ejecutar Terraform en paralelo (por defecto 10). Útil si una API tiene límites de tasa (rate limiting) estrictos.
+
+```bash
+terraform apply -replace="aws_instance.web"
+```
+
+Fuerza la destrucción y recreación de un recurso concreto en este apply, sin tener que cambiar su configuración (sustituye al antiguo ```terraform taint```).
+
+### 6. terraform destroy
+
+Elimina **todos** los recursos gestionados por la configuración actual.
+
+```bash
+terraform destroy
+```
+
+```bash
+terraform destroy -target=aws_instance.web
+```
+
+Destruye solo ese recurso (y lo que dependa exclusivamente de él). Uso puntual, no habitual.
+
+```bash
+terraform destroy -auto-approve
+```
+
+Sin confirmación **— especialmente peligroso**, se usa casi exclusivamente en entornos efímeros de CI (por ejemplo, tras tests de integración).
+
+### 7. terraform import
+
+Incorpora al **estado** un recurso que ya existe en AWS pero que no fue creado por Terraform (por ejemplo, algo creado manualmente hace tiempo).
+
+```bash
+terraform import aws_instance.web i-0abcd1234efgh5678
+```
+
+Esto asocia el recurso declarado en tu código (```aws_instance.web```, que debes haber escrito de antemano con una configuración que se aproxime a la real) con la instancia real ```i-0abcd1234efgh5678```.
+
+**Importante**: ```import``` solo actualiza el **estado**; no genera el código HCL por ti (en versiones modernas de Terraform existe el bloque ```import {}``` declarativo, que sí puede generar código junto con ```terraform plan -generate-config-out```, pero el comando clásico ```terraform import``` no lo hace).
+
+```bash
+terraform import 'aws_instance.app["web"]' i-0abcd1234efgh5678
+```
+
+Sintaxis para importar a un recurso definido con ```for_each``` (nótese las comillas para que la shell no interprete los corchetes).
+
+### 8. terraform taint / untaint
+
+**Nota histórica**: estos comandos están **obsoletos** desde Terraform 0.15+ a favor de ```terraform apply -replace=..```. (visto en el punto 5), pero siguen documentados porque aparecen en proyectos y tutoriales antiguos.
+
+```bash
+terraform taint aws_instance.web
+```
+
+Marca el recurso para que sea destruido y recreado en el próximo ```apply```, sin cambiar su configuración (útil si sospechas que algo "no está sano" y quieres forzar su recreación).
+
+```bash
+terraform untaint aws_instance.web
+```
+
+Revierte la marca anterior, si te arrepientes antes de aplicar.
+
+### 9. terraform graph
+
+Genera una representación del **grafo de dependencias** entre recursos, en formato DOT (Graphviz).
+
+```bash
+terraform graph
+```
+
+```
+digraph {
+  "aws_instance.web" -> "aws_subnet.publica"
+  "aws_subnet.publica" -> "aws_vpc.principal"
+}
+```
+
+Para visualizarlo como imagen (requiere tener Graphviz instalado):
+
+```bash
+terraform graph | dot -Tpng > grafo.png
+```
+
+Es especialmente útil para ```entender proyectos grandes``` que no escribiste tú, o para depurar por qué Terraform quiere aplicar cambios en un orden inesperado.
+
+### 10. terraform output
+
+Muestra los valores definidos como ```output``` del módulo raíz, **después de un apply**.
+
+```bash
+terraform output
+```
+
+```
+ip_publica = "34.201.XX.XX"
+id_vpc     = "vpc-0abc1234"
+```
+
+```bash
+terraform output ip_publica
+```
+
+Muestra solo ese output concreto.
+
+```bash
+terraform output -json
+```
+
+Formato JSON, pensado para ser consumido por scripts (por ejemplo, para pasar la IP resultante a otro proceso de un pipeline).
+
+```bash
+terraform output -raw ip_publica
+```
+
+Devuelve el valor **sin comillas ni formato JSON**, ideal para usarlo directamente en un script bash:
+
+```bash
+IP=$(terraform output -raw ip_publica)
+ssh ec2-user@$IP
+```
+
+### 11. terraform state
+
+Conjunto de subcomandos para **inspeccionar y manipular el estado directamente**. Se usan con cautela — modificar el estado a mano puede desincronizarlo de la realidad si no se hace correctamente (se profundiza en la Parte VI, "State Surgery").
+
+```bash
+terraform state list
+```
+
+Lista todos los recursos que hay actualmente en el estado.
+
+```
+aws_instance.web
+aws_vpc.principal
+aws_subnet.publica
+```
+
+```bash
+terraform state show aws_instance.web
+```
+
+Muestra todos los atributos actuales de ese recurso concreto, tal como están guardados en el estado.
+
+```bash
+terraform state mv aws_instance.web aws_instance.servidor_principal
+```
+
+Renombra un recurso **dentro del estado**, sin destruirlo ni recrearlo en AWS — típico al refactorizar código (por ejemplo, mover un recurso a un módulo).
+
+```bash
+terraform state rm aws_instance.web
+```
+
+Elimina el recurso **del estado**, pero **no lo destruye en AWS**. Terraform simplemente "olvida" que lo gestionaba. Útil si quieres dejar de gestionar algo con Terraform sin borrarlo.
+
+```bash
+terraform state pull > estado.json
+```
+
+Descarga el estado actual (incluso si es remoto) y lo vuelca a un fichero local, en formato JSON, para inspección manual.
+
+```bash
+terraform state push estado.json
+```
+
+Sube un fichero de estado local como el nuevo estado remoto. **Muy peligroso** si no sabes exactamente lo que haces — puede sobrescribir el estado real con uno desactualizado.
+
+### 12. terraform workspace
+
+Permite gestionar **múltiples estados aislados** dentro de la misma configuración de código, útil para separar entornos ligeros (dev/test) sin duplicar ficheros ```.tf```.
+
+```bash
+terraform workspace list
+```
+
+```
+* default
+  dev
+  produccion
+```
+
+(El asterisco marca el workspace activo.)
+
+```bash
+terraform workspace new dev
+```
+
+Crea un nuevo workspace (y cambia a él automáticamente).
+
+```bash
+terraform workspace select produccion
+```
+
+Cambia al workspace indicado.
+
+```bash
+terraform workspace show
+```
+
+Muestra el nombre del workspace activo actualmente.
+
+Dentro del código, puedes referenciar el workspace activo con ```terraform.workspace```:
+
+```hcl
+resource "aws_instance" "app" {
+  instance_type = terraform.workspace == "produccion" ? "t3.large" : "t3.micro"
+
+  tags = {
+    Entorno = terraform.workspace
+  }
+}
+```
+
+**Nota importante sobre workspaces**: son útiles para variaciones ligeras (mismo código, distinto tamaño de instancia), pero ```no sustituyen``` una separación real de entornos por carpetas/backends distintos cuando dev y producción tienen configuraciones muy diferentes o cuando quieres aislar completamente el blast radius de un error. Esta discusión se retoma en la Parte X (Buenas prácticas → Patrones).
