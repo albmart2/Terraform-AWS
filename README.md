@@ -1629,3 +1629,1108 @@ resource "aws_instance" "app" {
 ```
 
 **Nota importante sobre workspaces**: son útiles para variaciones ligeras (mismo código, distinto tamaño de instancia), pero ```no sustituyen``` una separación real de entornos por carpetas/backends distintos cuando dev y producción tienen configuraciones muy diferentes o cuando quieres aislar completamente el blast radius de un error. Esta discusión se retoma en la Parte X (Buenas prácticas → Patrones).
+
+## PARTE V — AWS (completa)
+
+### IAM (Identity and Access Management)
+
+IAM es el servicio que controla **quién puede hacer qué** dentro de una cuenta AWS. Es la base de todo lo demás: sin entender IAM, es fácil crear infraestructura insegura sin darse cuenta.
+
+#### Usuarios
+
+Un **usuario IAM** representa una identidad con credenciales propias y permanentes (access key + secret key, o contraseña para la consola).
+
+```hcl
+resource "aws_iam_user" "desarrollador" {
+  name = "ana-desarrolladora"
+
+  tags = {
+    Departamento = "Backend"
+  }
+}
+
+resource "aws_iam_access_key" "desarrollador_key" {
+  user = aws_iam_user.desarrollador.name
+}
+```
+
+**Importante**: ```aws_iam_access_key``` genera un secret que queda en el estado de Terraform. En proyectos reales, se recomienda **no gestionar usuarios humanos vía Terraform** cuando sea posible (usar SSO/Identity Center en su lugar), reservando IAM de Terraform sobre todo para roles y permisos de servicios.
+
+#### Roles
+
+Un **rol IAM** es una identidad **sin credenciales fijas*, que puede ser "asumida" temporalmente por un servicio de AWS (como EC2, Lambda) o por otro usuario/cuenta.
+
+```hcl
+resource "aws_iam_role" "rol_ec2" {
+  name = "rol-ec2-app"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+```
+
+El bloque ```assume_role_policy``` (llamado trust policy) define **quién puede asumir este rol** — en este caso, el propio servicio EC2. Esto permite, por ejemplo, que una instancia EC2 tenga permisos para leer de S3 sin necesidad de guardar credenciales dentro de la instancia.
+
+#### Policies
+
+Una **policy** es un documento JSON que define permisos: qué acciones están permitidas (o denegadas) sobre qué recursos.
+
+```hcl
+resource "aws_iam_policy" "acceso_s3_logs" {
+  name = "acceso-s3-logs"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject"
+        ]
+        Resource = "arn:aws:s3:::mi-app-logs-2026/*"
+      }
+    ]
+  })
+}
+```
+
+Estructura de un statement:
+
+- **Effect**: ```Allow``` o ```Deny```.
+- **Action**: qué operaciones de la API (con comodines posibles, ```s3:*```).
+- **Resource**: sobre qué recursos concretos (ARNs), con comodines posibles.
+- **Condition** (opcional): restricciones adicionales (por IP origen, por etiqueta, por hora...).
+
+#### Permissions (vincular policy con identidad)
+
+Una policy, por sí sola, no hace nada — debe **adjuntarse** a un usuario, grupo o rol:
+
+```hcl
+resource "aws_iam_role_policy_attachment" "adjuntar" {
+  role       = aws_iam_role.rol_ec2.name
+  policy_arn = aws_iam_policy.acceso_s3_logs.arn
+}
+```
+
+Para que una instancia EC2 use realmente ese rol, se necesita además un **Instance Profile**:
+
+```hcl
+resource "aws_iam_instance_profile" "perfil_ec2" {
+  name = "perfil-ec2-app"
+  role = aws_iam_role.rol_ec2.name
+}
+
+resource "aws_instance" "app" {
+  ami                  = "ami-0c55b159cbfafe1f0"
+  instance_type        = "t3.micro"
+  iam_instance_profile = aws_iam_instance_profile.perfil_ec2.name
+}
+```
+
+Con esto, cualquier código que corra dentro de esa instancia puede leer/escribir en el bucket ```mi-app-logs-2026``` **sin necesitar credenciales explícitas** — las obtiene automáticamente del servicio de metadata (visto más abajo).
+
+#### Least Privilege (mínimo privilegio)
+
+Es el principio de dar solo los permisos estrictamente necesarios, ni uno más. En la práctica:
+
+- Evita ```Action = "*"``` y ```Resource = "*"``` salvo que sea genuinamente necesario (y casi nunca lo es).
+- Prefiere policies específicas por servicio y recurso concreto, en lugar de policies gestionadas amplias como ```AmazonS3FullAccess```.
+- Usa ```Condition``` para acotar aún más (por ejemplo, solo permitir acceso desde una VPC concreta).
+
+```hcl
+# Mal: demasiado permisivo
+resource "aws_iam_policy" "malo" {
+  policy = jsonencode({
+    Statement = [{ Effect = "Allow", Action = "*", Resource = "*" }]
+  })
+}
+
+# Bien: acotado a lo necesario
+resource "aws_iam_policy" "bueno" {
+  policy = jsonencode({
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject"]
+      Resource = "arn:aws:s3:::mi-app-logs-2026/lecturas/*"
+    }]
+  })
+}
+```
+
+### EC2 (Elastic Compute Cloud)
+
+EC2 son las máquinas virtuales de AWS. Es probablemente el servicio más usado en cualquier curso de introducción a la nube.
+
+#### AMI (Amazon Machine Image)
+
+Una AMI es la **imagen base** (sistema operativo + software preinstalado + configuración) desde la que se lanza una instancia. En vez de hardcodear el ID de una AMI (que cambia según la región y se actualiza con el tiempo), es buena práctica **buscarla dinámicamente** con un ```data source```:
+
+```hcl
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+}
+```
+
+Esto garantiza que siempre se use la AMI de Amazon Linux más reciente disponible, sin tener que actualizar el ID manualmente cada pocos meses.
+
+#### Tipos de instancia
+
+Los tipos de instancia definen la combinación de CPU, memoria, red y almacenamiento. Se agrupan en familias:
+
+|Familia|Enfoque|Ejemplo de uso|
+|-------|-------|--------------|
+|```t (t3, t4g)```|Uso general, con "burst" de CPU|Webs pequeñas, entornos dev|
+|```m (m5, m6i)```|Uso general balanceado|Aplicaciones estándar de producción|
+|```c (c5, c6i)```|Optimizado a CPU|Procesamiento intensivo, colas|
+|```r (r5, r6i)```|Optimizado a memoria|Bases de datos en memoria, caché|
+|```i (i3)```|Almacenamiento local NVMe|Bases de datos con alto I/O|
+
+```hcl
+variable "tipo_instancia" {
+  type    = string
+  default = "t3.micro"
+
+  validation {
+    condition     = can(regex("^[a-z][0-9][a-z]?\\.", var.tipo_instancia))
+    error_message = "Debe ser un tipo de instancia EC2 válido, por ejemplo t3.micro."
+  }
+}
+```
+
+####EBS (Elastic Block Store)
+
+Discos de bloque persistentes que se adjuntan a una instancia. El volumen "raíz" se puede configurar directamente en el recurso ```aws_instance```:
+
+```hcl
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+    encrypted   = true
+  }
+}
+```
+
+Para discos **adicionales** (separados del root):
+
+```hcl
+resource "aws_ebs_volume" "datos" {
+  availability_zone = aws_instance.app.availability_zone
+  size              = 100
+  type              = "gp3"
+  encrypted         = true
+}
+
+resource "aws_volume_attachment" "adjuntar_datos" {
+  device_name = "/dev/sdh"
+  volume_id   = aws_ebs_volume.datos.id
+  instance_id = aws_instance.app.id
+}
+```
+
+#### Key Pairs
+
+Par de claves SSH para acceso remoto seguro. La práctica recomendada es **generar la clave privada localmente** y subir solo la pública a AWS:
+
+```bash
+ssh-keygen -t ed25519 -f clave-curso -C "curso-terraform"
+```
+
+```hcl
+resource "aws_key_pair" "curso" {
+  key_name   = "clave-curso"
+  public_key = file("${path.module}/clave-curso.pub")
+}
+
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+  key_name      = aws_key_pair.curso.key_name
+}
+```
+
+```clave-curso``` (la privada) **nunca** debe subirse a Git ni gestionarse vía Terraform — solo la pública.
+
+#### Elastic IP
+
+Una IP pública **fija**, que se puede reasignar entre instancias (a diferencia de la IP pública "normal" de una instancia, que cambia si esta se detiene y arranca de nuevo).
+
+```hcl
+resource "aws_eip" "ip_fija" {
+  instance = aws_instance.app.id
+  domain   = "vpc"
+}
+
+output "ip_publica_fija" {
+  value = aws_eip.ip_fija.public_ip
+}
+```
+
+#### User Data
+
+Script que se ejecuta **automáticamente** la primera vez que arranca la instancia (bootstrapping) — muy usado para instalar software sin tener que conectarse manualmente por SSH.
+
+```hcl
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+
+  user_data = <<-EOF
+    #!/bin/bash
+    dnf update -y
+    dnf install -y nginx
+    systemctl enable nginx
+    systemctl start nginx
+    echo "<h1>Desplegado con Terraform</h1>" > /usr/share/nginx/html/index.html
+  EOF
+}
+```
+
+**Nota**: si cambias el contenido de ```user_data``` en una instancia ya creada, Terraform lo actualiza en el estado, pero **AWS no vuelve a ejecutar el script automáticamente** en una instancia ya arrancada — solo se ejecuta en el primer arranque. Para forzar la recreación cuando cambia el script, se suele combinar con ```user_data_replace_on_change = true```:
+
+```hcl
+resource "aws_instance" "app" {
+  # ...
+  user_data_replace_on_change = true
+}
+```
+
+#### Metadata
+
+Cada instancia EC2 expone un servicio interno de metadata, accesible **solo desde dentro** de la propia instancia, en ```http://169.254.169.254```. Permite que un script (o la propia aplicación) obtenga información sobre sí misma sin necesidad de credenciales:
+
+```bash
+# Desde dentro de la instancia (IMDSv2, el método seguro actual):
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id
+```
+
+Terraform permite forzar el uso de **IMDSv2** (más seguro que la v1, que es vulnerable a ciertos ataques de SSRF) directamente en la definición de la instancia:
+
+```hcl
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+
+  metadata_options {
+    http_tokens                = "required"  # fuerza IMDSv2
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 1
+  }
+}
+```
+
+Este es exactamente el tipo de configuración que herramientas como ```tfsec```/```checkov``` comprueban automáticamente, marcando como vulnerable cualquier instancia sin ```http_tokens = "required"```.
+
+##### VPC y CIDR
+
+Una **VPC** (Virtual Private Cloud) es tu red privada y aislada dentro de AWS. Todo lo demás (instancias, bases de datos, balanceadores) vive dentro de una VPC.
+
+El **CIDR** define el rango de direcciones IP disponible para la red, en notación ```IP/máscara```:
+
+```hcl
+resource "aws_vpc" "principal" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "vpc-principal"
+  }
+}
+```
+
+```10.0.0.0/16``` significa que los primeros 16 bits son fijos (10.0), dejando 65.536 direcciones IP disponibles (10.0.0.0 – 10.0.255.255) para repartir entre subnets.
+
+#### Subnets
+
+Subdivisiones de la VPC, cada una asociada a una **zona de disponibilidad** concreta. Se distingue entre subnets **públicas** (con salida directa a internet) y **privadas*+ (sin ella).
+
+```hcl
+resource "aws_subnet" "publica_a" {
+  vpc_id                  = aws_vpc.principal.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "eu-west-1a"
+  map_public_ip_on_launch = true
+
+  tags = { Name = "subnet-publica-a" }
+}
+
+resource "aws_subnet" "privada_a" {
+  vpc_id            = aws_vpc.principal.id
+  cidr_block        = "10.0.10.0/24"
+  availability_zone = "eu-west-1a"
+
+  tags = { Name = "subnet-privada-a" }
+}
+```
+
+Usando ```cidrsubnet()``` se puede calcular esto dinámicamente en vez de escribirlo a mano:
+
+```hcl
+resource "aws_subnet" "publica" {
+  for_each          = toset(["eu-west-1a", "eu-west-1b"])
+  vpc_id            = aws_vpc.principal.id
+  cidr_block        = cidrsubnet(aws_vpc.principal.cidr_block, 8, index(["eu-west-1a", "eu-west-1b"], each.value))
+  availability_zone = each.value
+}
+```
+
+#### Routing
+
+Una **tabla de rutas** determina hacia dónde sale el tráfico de una subnet.
+
+```hcl
+resource "aws_route_table" "publica" {
+  vpc_id = aws_vpc.principal.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.principal.id
+  }
+
+  tags = { Name = "rt-publica" }
+}
+
+resource "aws_route_table_association" "publica_a" {
+  subnet_id      = aws_subnet.publica_a.id
+  route_table_id = aws_route_table.publica.id
+}
+```
+
+#### Internet Gateway
+
+Componente que da salida (y entrada) a internet a una VPC:
+
+```hcl
+resource "aws_internet_gateway" "principal" {
+  vpc_id = aws_vpc.principal.id
+  tags   = { Name = "igw-principal" }
+}
+```
+
+#### NAT Gateway
+
+Permite que recursos en subnets **privadas** salgan a internet (por ejemplo, para descargar actualizaciones) **sin ser accesibles desde fuera**:
+
+```hcl
+resource "aws_eip" "nat" {
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "principal" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.publica_a.id  # el NAT vive en una subnet pública
+
+  tags = { Name = "nat-principal" }
+}
+
+resource "aws_route_table" "privada" {
+  vpc_id = aws_vpc.principal.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.principal.id
+  }
+}
+
+resource "aws_route_table_association" "privada_a" {
+  subnet_id      = aws_subnet.privada_a.id
+  route_table_id = aws_route_table.privada.id
+}
+```
+
+**Coste importante a tener en cuenta**: un NAT Gateway tiene coste por hora y por GB transferido — es habitual que sea una de las partidas de coste más altas de una cuenta AWS pequeña. Se retoma en la Parte X (Costes).
+
+#### Security Groups
+
+Firewall a nivel de **instancia**, con estado (*stateful*: si permites tráfico de entrada, la respuesta de salida se permite automáticamente).
+
+```hcl
+resource "aws_security_group" "web" {
+  name   = "sg-web"
+  vpc_id = aws_vpc.principal.id
+
+  ingress {
+    description = "HTTP desde cualquier origen"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SSH solo desde mi IP"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["203.0.113.10/32"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+#### Network ACL
+
+Firewall a nivel de **subnet**, sin estado (*stateless*: hay que permitir explícitamente entrada Y salida por separado). Es una capa adicional, más rígida, que complementa (no sustituye) a los Security Groups:
+
+```hcl
+resource "aws_network_acl" "publica" {
+  vpc_id     = aws_vpc.principal.id
+  subnet_ids = [aws_subnet.publica_a.id]
+
+  ingress {
+    rule_no    = 100
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 80
+    to_port    = 80
+  }
+
+  egress {
+    rule_no    = 100
+    protocol   = "-1"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 0
+    to_port    = 0
+  }
+}
+```
+
+#### VPC Endpoints
+
+Permiten acceder a servicios de AWS (como S3 o DynamoDB) **sin salir a internet**, mejorando seguridad y, a menudo, reduciendo coste de NAT:
+
+```hcl
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id       = aws_vpc.principal.id
+  service_name = "com.amazonaws.eu-west-1.s3"
+  route_table_ids = [aws_route_table.privada.id]
+}
+```
+
+#### Peering
+
+Conexión directa entre dos VPCs (misma cuenta u otra), como si fueran una sola red a efectos de enrutamiento:
+
+```hcl
+resource "aws_vpc_peering_connection" "con_otra_vpc" {
+  vpc_id      = aws_vpc.principal.id
+  peer_vpc_id = "vpc-0123456789abcdef0"
+  auto_accept = true
+}
+```
+
+#### Transit Gateway
+
+Un "hub" central para conectar **muchas** VPCs (y redes on-premise vía VPN/Direct Connect) sin tener que crear peering entre cada par de VPCs (que crece de forma combinatoria):
+
+```hcl
+resource "aws_ec2_transit_gateway" "principal" {
+  description = "TGW central de la organización"
+}
+
+resource "aws_ec2_transit_gateway_vpc_attachment" "principal" {
+  transit_gateway_id = aws_ec2_transit_gateway.principal.id
+  vpc_id             = aws_vpc.principal.id
+  subnet_ids         = [aws_subnet.privada_a.id]
+}
+```
+
+### Balanceadores
+
+#### ALB (Application Load Balancer)
+
+Balanceador de **capa 7** (HTTP/HTTPS), con capacidad de enrutar según ruta, cabecera o dominio:
+
+```hcl
+resource "aws_lb" "principal" {
+  name               = "alb-principal"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.web.id]
+  subnets            = [aws_subnet.publica_a.id, aws_subnet.publica_b.id]
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.principal.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+```
+
+#### NLB (Network Load Balancer)
+
+Balanceador de **capa 4** (TCP/UDP), pensado para altísimo rendimiento y baja latencia, o protocolos no HTTP:
+
+```hcl
+resource "aws_lb" "nlb" {
+  name               = "nlb-principal"
+  internal           = false
+  load_balancer_type = "network"
+  subnets            = [aws_subnet.publica_a.id]
+}
+```
+
+#### Target Groups
+
+Conjunto de destinos (instancias, IPs o Lambdas) a los que el balanceador dirige tráfico:
+
+```hcl
+resource "aws_lb_target_group" "app" {
+  name     = "tg-app"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.principal.id
+
+  health_check {
+    path                = "/salud"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    matcher             = "200"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "app" {
+  target_group_arn = aws_lb_target_group.app.arn
+  target_id        = aws_instance.app.id
+  port             = 80
+}
+```
+
+#### Health Checks
+
+Ya vistos arriba dentro del ```target_group```: comprobaciones periódicas para determinar si un destino puede seguir recibiendo tráfico. Si falla el número de veces indicado en ```unhealthy_threshold```, el balanceador deja de enviarle tráfico hasta que vuelva a responder correctamente ```healthy_threshold``` veces seguidas.
+
+### Auto Scaling
+
+#### Launch Templates
+
+Plantilla que define cómo lanzar cada instancia del grupo de autoescalado (equivalente reutilizable a ```aws_instance```, pero pensado para ser referenciado por un Auto Scaling Group):
+
+```hcl
+resource "aws_launch_template" "app" {
+  name_prefix   = "lt-app-"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+
+  vpc_security_group_ids = [aws_security_group.web.id]
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    dnf install -y nginx
+    systemctl enable --now nginx
+  EOF
+  )
+}
+```
+
+#### Auto Scaling Group + Scaling Policies
+
+```hcl
+resource "aws_autoscaling_group" "app" {
+  desired_capacity   = 2
+  min_size           = 1
+  max_size           = 5
+  vpc_zone_identifier = [aws_subnet.privada_a.id]
+  target_group_arns  = [aws_lb_target_group.app.arn]
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "asg-app"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_autoscaling_policy" "escalar_por_cpu" {
+  name                   = "escalar-cpu"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 60.0
+  }
+}
+```
+
+Esta política de tipo ```TargetTrackingScaling``` mantiene automáticamente el uso medio de CPU del grupo cerca del 60%, añadiendo o quitando instancias según haga falta — sin tener que definir manualmente umbrales de CloudWatch por separado.
+
+### S3 (Simple Storage Service)
+
+#### Buckets
+
+```hcl
+resource "aws_s3_bucket" "app" {
+  bucket = "mi-app-datos-2026"
+}
+```
+
+#### Versioning
+
+```hcl
+resource "aws_s3_bucket_versioning" "app" {
+  bucket = aws_s3_bucket.app.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+```
+
+Con versionado activo, sobrescribir o borrar un objeto no lo elimina realmente — crea una nueva versión o un "delete marker", permitiendo recuperar versiones anteriores.
+
+#### Lifecycle
+
+Reglas para mover objetos a almacenamiento más barato, o eliminarlos, según su antigüedad:
+
+```hcl
+resource "aws_s3_bucket_lifecycle_configuration" "app" {
+  bucket = aws_s3_bucket.app.id
+
+  rule {
+    id     = "archivar-antiguos"
+    status = "Enabled"
+
+    transition {
+      days          = 90
+      storage_class = "GLACIER"
+    }
+
+    expiration {
+      days = 365
+    }
+  }
+}
+```
+
+#### Encryption
+
+```hcl
+resource "aws_s3_bucket_server_side_encryption_configuration" "app" {
+  bucket = aws_s3_bucket.app.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "aws:kms"
+    }
+    bucket_key_enabled = true
+  }
+}
+```
+
+#### Replication
+
+Copia automática de objetos hacia otro bucket, típicamente en otra región (requiere versionado activo en ambos buckets y un rol IAM con permisos):
+
+```hcl
+resource "aws_s3_bucket_replication_configuration" "app" {
+  role   = aws_iam_role.replicacion.arn
+  bucket = aws_s3_bucket.app.id
+
+  rule {
+    id     = "replicar-todo"
+    status = "Enabled"
+
+    destination {
+      bucket        = "arn:aws:s3:::mi-app-datos-2026-replica"
+      storage_class = "STANDARD"
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.app]
+}
+```
+
+#### Hosting Web
+
+```hcl
+resource "aws_s3_bucket_website_configuration" "app" {
+  bucket = aws_s3_bucket.app.id
+
+  index_document {
+    suffix = "index.html"
+  }
+
+  error_document {
+    key = "error.html"
+  }
+}
+```
+
+Nota: para servir contenido públicamente hoy en día se recomienda combinar S3 con **CloudFront delante** (visto más abajo), en vez de exponer el hosting web de S3 directamente, por seguridad y rendimiento.
+
+### RDS (Relational Database Service)
+
+```hcl
+resource "aws_db_subnet_group" "principal" {
+  name       = "db-subnet-group"
+  subnet_ids = [aws_subnet.privada_a.id, aws_subnet.privada_b.id]
+}
+
+resource "aws_db_instance" "principal" {
+  identifier             = "app-db"
+  engine                 = "postgres"
+  engine_version         = "16.3"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  db_name                = "appdb"
+  username               = "admin"
+  password               = var.password_db  # marcado sensitive en variables.tf
+  db_subnet_group_name   = aws_db_subnet_group.principal.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+
+  backup_retention_period = 7
+  skip_final_snapshot     = false
+  final_snapshot_identifier = "app-db-final-snapshot"
+}
+```
+
+#### Aurora
+
+Motor propio de AWS, compatible con MySQL/PostgreSQL, con arquitectura de almacenamiento distribuido separada del cómputo:
+
+```hcl
+resource "aws_rds_cluster" "aurora" {
+  cluster_identifier = "app-aurora"
+  engine             = "aurora-postgresql"
+  engine_version     = "16.2"
+  master_username    = "admin"
+  master_password    = var.password_db
+  database_name      = "appdb"
+
+  db_subnet_group_name = aws_db_subnet_group.principal.name
+}
+
+resource "aws_rds_cluster_instance" "aurora_instancias" {
+  count              = 2
+  cluster_identifier = aws_rds_cluster.aurora.id
+  instance_class     = "db.r6g.large"
+  engine             = aws_rds_cluster.aurora.engine
+}
+```
+
+#### Snapshots y Backups
+
+```hcl
+resource "aws_db_snapshot" "manual" {
+  db_instance_identifier = aws_db_instance.principal.identifier
+  db_snapshot_identifier = "snapshot-manual-2026"
+}
+```
+
+Los backups automáticos se configuran con ```backup_retention_period``` (visto arriba) y ```backup_window```, sin necesidad de un recurso separado.
+
+#### Subnet Groups
+
+Ya visto arriba (```aws_db_subnet_group```): define en qué subnets puede desplegarse la base de datos — normalmente subnets privadas, sin acceso directo desde internet.
+
+### Otros servicios
+
+#### DynamoDB
+
+Base de datos NoSQL clave-valor/documentos, totalmente gestionada:
+
+```hcl
+resource "aws_dynamodb_table" "sesiones" {
+  name         = "sesiones"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "id_sesion"
+
+  attribute {
+    name = "id_sesion"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expira_en"
+    enabled        = true
+  }
+}
+```
+
+#### Lambda
+
+Cómputo serverless: código que se ejecuta en respuesta a eventos, sin gestionar servidores.
+
+```hcl
+resource "aws_lambda_function" "procesador" {
+  function_name = "procesador-eventos"
+  role          = aws_iam_role.rol_lambda.arn
+  handler       = "index.handler"
+  runtime       = "nodejs20.x"
+  filename      = "lambda.zip"
+  source_code_hash = filebase64sha256("lambda.zip")
+}
+```
+
+#### API Gateway
+
+Expone APIs HTTP que pueden invocar Lambda u otros backends:
+
+```hcl
+resource "aws_apigatewayv2_api" "principal" {
+  name          = "api-app"
+  protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_integration" "lambda" {
+  api_id             = aws_apigatewayv2_api.principal.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.procesador.invoke_arn
+}
+
+resource "aws_apigatewayv2_route" "default" {
+  api_id    = aws_apigatewayv2_api.principal.id
+  route_key = "POST /procesar"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+```
+
+#### Route53
+
+DNS gestionado:
+
+```hcl
+resource "aws_route53_zone" "principal" {
+  name = "miapp.com"
+}
+
+resource "aws_route53_record" "www" {
+  zone_id = aws_route53_zone.principal.zone_id
+  name    = "www.miapp.com"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.principal.dns_name
+    zone_id                = aws_lb.principal.zone_id
+    evaluate_target_health = true
+  }
+}
+```
+
+#### CloudFront
+
+CDN de AWS:
+
+```hcl
+resource "aws_cloudfront_distribution" "app" {
+  enabled = true
+
+  origin {
+    domain_name = aws_s3_bucket.app.bucket_regional_domain_name
+    origin_id   = "s3-app"
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "s3-app"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods          = ["GET", "HEAD"]
+
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+  }
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+}
+```
+
+#### CloudWatch
+
+Monitorización, métricas, logs y alarmas:
+
+```hcl
+resource "aws_cloudwatch_metric_alarm" "cpu_alta" {
+  alarm_name          = "cpu-alta-app"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+
+  dimensions = {
+    InstanceId = aws_instance.app.id
+  }
+}
+```
+
+#### Secrets Manager
+
+```hcl
+resource "aws_secretsmanager_secret" "password_db" {
+  name = "app/password-db"
+}
+
+resource "aws_secretsmanager_secret_version" "password_db" {
+  secret_id     = aws_secretsmanager_secret.password_db.id
+  secret_string = var.password_db
+}
+```
+
+Incluye rotación automática configurable, algo que Parameter Store no ofrece de forma nativa.
+
+#### Parameter Store
+
+Alternativa más ligera (y gratuita hasta cierto límite) dentro de Systems Manager, para configuración y secretos sencillos:
+
+```hcl
+resource "aws_ssm_parameter" "nivel_log" {
+  name  = "/app/nivel-log"
+  type  = "String"
+  value = "INFO"
+}
+
+resource "aws_ssm_parameter" "password_db" {
+  name  = "/app/password-db"
+  type  = "SecureString"
+  value = var.password_db
+}
+```
+
+#### ECS (Elastic Container Service)
+
+Orquestador de contenedores nativo de AWS:
+
+```hcl
+resource "aws_ecs_cluster" "principal" {
+  name = "cluster-app"
+}
+
+resource "aws_ecs_task_definition" "app" {
+  family                   = "app"
+  requires_compatibilities  = ["FARGATE"]
+  network_mode              = "awsvpc"
+  cpu                       = "256"
+  memory                    = "512"
+  execution_role_arn        = aws_iam_role.rol_ec2.arn
+
+  container_definitions = jsonencode([
+    {
+      name  = "app"
+      image = "${aws_ecr_repository.app.repository_url}:latest"
+      portMappings = [{ containerPort = 80 }]
+    }
+  ])
+}
+
+resource "aws_ecs_service" "app" {
+  name            = "servicio-app"
+  cluster         = aws_ecs_cluster.principal.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = 2
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = [aws_subnet.privada_a.id]
+    security_groups = [aws_security_group.web.id]
+  }
+}
+```
+
+#### ECR (Elastic Container Registry)
+
+Registro privado de imágenes de contenedor:
+
+```hcl
+resource "aws_ecr_repository" "app" {
+  name                 = "app"
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+```
+
+#### EKS (Elastic Kubernetes Service)
+
+Kubernetes gestionado por AWS:
+
+```hcl
+resource "aws_eks_cluster" "principal" {
+  name     = "cluster-k8s"
+  role_arn = aws_iam_role.rol_eks.arn
+  version  = "1.30"
+
+  vpc_config {
+    subnet_ids = [aws_subnet.privada_a.id, aws_subnet.privada_b.id]
+  }
+}
+
+resource "aws_eks_node_group" "principal" {
+  cluster_name    = aws_eks_cluster.principal.name
+  node_group_name = "nodos-principales"
+  node_role_arn   = aws_iam_role.rol_nodos_eks.arn
+  subnet_ids      = [aws_subnet.privada_a.id]
+
+  scaling_config {
+    desired_size = 2
+    min_size     = 1
+    max_size     = 4
+  }
+}
+```
