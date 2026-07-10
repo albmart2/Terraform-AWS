@@ -2734,3 +2734,430 @@ resource "aws_eks_node_group" "principal" {
   }
 }
 ```
+
+## PARTE VI — Terraform Avanzado
+
+Con AWS ya cubierto en profundidad, esta parte vuelve a Terraform en sí mismo: cómo organizar, reutilizar y gestionar en equipo configuraciones que crecen más allá de un único fichero.
+
+### 1. Modules
+
+Un **módulo** es un conjunto de ficheros ```.tf``` que se agrupan y se reutilizan como si fueran una "función" de infraestructura: recibe variables de entrada y expone outputs.
+
+**Todo proyecto de Terraform es, técnicamente, un módulo** — el directorio raíz es el "módulo raíz". Lo que llamamos "módulos" en la práctica son módulos **hijos**, invocados desde otro sitio.
+
+#### Estructura de un módulo
+
+```
+modules/
+└── vpc/
+    ├── main.tf
+    ├── variables.tf
+    └── outputs.tf
+```
+
+```hcl
+# modules/vpc/variables.tf
+variable "cidr_block" {
+  type = string
+}
+
+variable "nombre" {
+  type = string
+}
+```
+
+```hcl
+# modules/vpc/main.tf
+resource "aws_vpc" "principal" {
+  cidr_block = var.cidr_block
+  tags       = { Name = var.nombre }
+}
+
+resource "aws_subnet" "publica" {
+  vpc_id     = aws_vpc.principal.id
+  cidr_block = cidrsubnet(var.cidr_block, 8, 1)
+}
+```
+
+```hcl
+# modules/vpc/outputs.tf
+output "vpc_id" {
+  value = aws_vpc.principal.id
+}
+
+output "subnet_publica_id" {
+  value = aws_subnet.publica.id
+}
+```
+
+#### Uso del módulo desde el módulo raíz
+
+```hcl
+# main.tf (raíz)
+module "red_produccion" {
+  source     = "./modules/vpc"
+  cidr_block = "10.0.0.0/16"
+  nombre     = "vpc-produccion"
+}
+
+module "red_desarrollo" {
+  source     = "./modules/vpc"
+  cidr_block = "10.1.0.0/16"
+  nombre     = "vpc-desarrollo"
+}
+
+resource "aws_instance" "app" {
+  subnet_id = module.red_produccion.subnet_publica_id
+  # ...
+}
+```
+
+Con un único módulo, se crean dos **VPCs distintas** (producción y desarrollo) sin duplicar código.
+
+#### Módulos de un registro (público o privado)
+
+```hcl
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.8.1"
+
+  name = "vpc-app"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["eu-west-1a", "eu-west-1b"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24"]
+}
+```
+
+El registro público de Terraform (```registry.terraform.io```) tiene módulos verificados y mantenidos por la comunidad para los patrones más comunes (VPC, EKS, RDS...), que ahorran tener que reescribir configuraciones estándar desde cero.
+
+#### 2. Remote State y Backend
+
+Por defecto, el estado se guarda en un fichero local (```terraform.tfstate```) en tu propio ordenador. Esto es un problema en equipo: si dos personas aplican cambios desde su propia máquina, cada una tiene una copia distinta del estado, y se pisan entre sí.
+
+Un **backend remoto** resuelve esto guardando el estado en un lugar centralizado y compartido:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "mi-empresa-terraform-state"
+    key            = "app/produccion/terraform.tfstate"
+    region         = "eu-west-1"
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
+  }
+}
+```
+
+Con esto:
+
+- El estado vive en S3, no en tu disco.
+- Cualquiera del equipo con permisos puede ejecutar ```terraform plan```/```apply``` y ver el estado real y actualizado.
+- ```dynamodb_table``` añade **bloqueo**, para que dos personas no apliquen a la vez.
+
+#### 3. Outputs
+
+Ya vistos en módulos, pero como recordatorio de su uso en el módulo raíz: exponen valores tras un ```apply```, consultables con ```terraform output``` o consumibles por otro proyecto vía ```terraform_remote_state```.
+
+```hcl
+output "ip_publica_app" {
+  description = "IP pública de la instancia principal"
+  value       = aws_instance.app.public_ip
+}
+```
+
+### 4. Locals
+
+Valores calculados o alias internos, para no repetir la misma expresión en varios sitios ni ensuciar el código con lógica repetida:
+
+```hcl
+locals {
+  nombre_proyecto = "mi-app"
+  entorno         = terraform.workspace
+
+  nombre_completo = "${local.nombre_proyecto}-${local.entorno}"
+
+  tags_comunes = {
+    Proyecto = local.nombre_proyecto
+    Entorno  = local.entorno
+    GestionadoPor = "terraform"
+  }
+}
+
+resource "aws_instance" "app" {
+  # ...
+  tags = merge(local.tags_comunes, { Name = local.nombre_completo })
+}
+
+resource "aws_s3_bucket" "app" {
+  bucket = "${local.nombre_completo}-datos"
+  tags   = local.tags_comunes
+}
+```
+
+A diferencia de las ```variable```, los ```locals``` **no se pueden sobreescribir desde fuera** (ni por CLI, ni por ```.tfvars```) — son puramente internos al módulo.
+
+### 5. Data Sources
+
+Consultas de **solo lectura** a recursos que ya existen — propios (creados por otro proyecto Terraform) o de terceros (creados manualmente, o gestionados por otro equipo):
+
+```hcl
+data "aws_vpc" "existente" {
+  filter {
+    name   = "tag:Name"
+    values = ["vpc-produccion"]
+  }
+}
+
+data "aws_subnets" "privadas" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.existente.id]
+  }
+
+  tags = {
+    Tipo = "privada"
+  }
+}
+
+resource "aws_instance" "app" {
+  subnet_id = data.aws_subnets.privadas.ids[0]
+  # ...
+}
+```
+
+Ya usamos data sources antes sin nombrarlos como tal: ```data "aws_ami"``` es exactamente esto — una consulta de solo lectura a AWS, sin gestionar el ciclo de vida de lo consultado.
+
+### 6. terraform_remote_state (consumir el estado de otro proyecto)
+
+Un caso especial de data source que permite leer los **outputs** de otro proyecto Terraform, típicamente cuando la red la gestiona un equipo/repositorio y la aplicación la gestiona otro:
+
+```hcl
+data "terraform_remote_state" "red" {
+  backend = "s3"
+  config = {
+    bucket = "mi-empresa-terraform-state"
+    key    = "red/produccion/terraform.tfstate"
+    region = "eu-west-1"
+  }
+}
+
+resource "aws_instance" "app" {
+  subnet_id = data.terraform_remote_state.red.outputs.subnet_privada_id
+}
+```
+
+Esto conecta dos proyectos Terraform completamente independientes (con sus propios ciclos de ```plan```/```apply```) a través del estado, sin necesidad de módulos compartidos.
+
+### 7. Provisioners
+
+Mecanismo para ejecutar acciones (típicamente scripts) **tras crear** un recurso. HashiCorp los describe explícitamente como "**último recurso**", porque rompen el modelo declarativo de Terraform: introducen pasos imperativos y no se pueden planificar de antemano de forma fiable.
+
+```hcl
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+  key_name      = aws_key_pair.curso.key_name
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo dnf install -y nginx",
+      "sudo systemctl start nginx"
+    ]
+
+    connection {
+      type        = "ssh"
+      user        = "ec2-user"
+      private_key = file("clave-curso")
+      host        = self.public_ip
+    }
+  }
+}
+```
+
+**Por qué evitarlos cuando sea posible**: si el script falla a mitad, el recurso queda en un estado ambiguo (¿se creó pero no se configuró?), y Terraform no puede "recalcular" bien un plan futuro. Alternativas preferibles casi siempre: ```user_data```, o herramientas de configuración dedicadas como Ansible.
+
+### 8. Lifecycle
+
+Meta-argumento disponible en **cualquier resource**, para controlar comportamientos especiales de su ciclo de vida:
+
+```hcl
+resource "aws_instance" "app" {
+  # ...
+
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy        = false
+    ignore_changes          = [tags["UltimaModificacion"]]
+  }
+}
+```
+
+- ```create_before_destroy```: cuando un cambio requiere destruir y recrear un recurso, crea primero el nuevo y luego destruye el viejo (en vez del orden por defecto, destruir-luego-crear). Imprescindible para recursos que no pueden tener downtime, como un Launch Template en uso.
+- ```prevent_destroy```: bloquea cualquier intento de ```destroy``` sobre ese recurso concreto (Terraform da error si lo intentas), como salvaguarda para recursos críticos (una base de datos de producción, por ejemplo).
+- ```ignore_changes```: le dice a Terraform que ignore cambios en atributos concretos, útil cuando algo externo (un proceso automático, o AWS mismo) modifica ese atributo y no quieres que Terraform intente revertirlo constantemente.
+
+### 9. Depends_on
+
+Ya visto en la Parte I como concepto; aquí, su forma explícita para forzar una dependencia que Terraform no puede inferir de los atributos:
+
+```hcl
+resource "aws_iam_role_policy" "permiso_lambda" {
+  # ...
+}
+
+resource "aws_lambda_function" "procesador" {
+  # ...
+  depends_on = [aws_iam_role_policy.permiso_lambda]
+}
+```
+
+También aplicable a **módulos completos**:
+
+```hcl
+module "app" {
+  source     = "./modules/app"
+  depends_on = [module.red]
+}
+```
+
+### 10. Import (ampliación)
+
+Aquí, el enfoque **declarativo** moderno (Terraform 1.5+), que además puede generar el código HCL automáticamente:
+
+```hcl
+import {
+  to = aws_instance.app
+  id = "i-0abcd1234efgh5678"
+}
+```
+
+```bash
+terraform plan -generate-config-out=generado.tf
+```
+
+Esto genera un fichero ```generado.tf``` con el bloque ```resource "aws_instance" "app" { ... }``` ya relleno con la configuración real de la instancia importada — mucho más rápido que escribirlo a mano y luego ajustar hasta que el ```plan``` no muestre diferencias.
+
+### 11. State Move
+
+Mover un recurso **dentro del estado**, sin tocar la infraestructura real — típico al refactorizar código (por ejemplo, mover un recurso suelto a dentro de un módulo):
+
+```bash
+terraform state mv aws_instance.app module.servidor_app.aws_instance.app
+```
+
+También existe el bloque declarativo ```moved {}``` (Terraform 1.1+), preferible porque queda documentado en el propio código en lugar de ser un comando puntual que alguien podría olvidar ejecutar:
+
+```hcl
+moved {
+  from = aws_instance.app
+  to   = module.servidor_app.aws_instance.app
+}
+```
+
+Cuando alguien ejecuta ```terraform plan``` con este bloque presente, Terraform detecta automáticamente el movimiento y actualiza el estado sin planificar destruir/recrear nada.
+
+### 12. Refresh
+
+Sincroniza el estado con la infraestructura **real**, detectando cambios hechos fuera de Terraform (drift):
+
+```bash
+terraform apply -refresh-only
+```
+
+Este comando muestra las diferencias entre el estado guardado y la realidad, y pregunta si quieres **actualizar el estado** para reflejarlas (sin tocar la infraestructura real — solo corrige lo que Terraform "cree" que existe).
+
+Es la forma correcta de detectar y decidir qué hacer ante un **configuration drift** (por ejemplo, alguien cambió el tamaño de una instancia manualmente desde la consola).
+
+### 13. State Surgery
+
+Conjunto de técnicas **avanzadas y delicadas** para editar el estado directamente cuando los comandos estándar no bastan — por ejemplo, si el estado se corrompió, o si necesitas hacer un cambio muy específico que ningún comando cubre.
+
+```bash
+# Descargar el estado a un fichero local
+terraform state pull > estado.json
+
+# Editarlo manualmente (con muchísimo cuidado) con un editor de texto
+# o con herramientas como jq:
+jq '.resources[] | select(.name=="app")' estado.json
+
+# Subir el estado modificado de vuelta
+terraform state push estado.json
+```
+
+#### Advertencias importantes:
+
+- Siempre haz una copia de seguridad del estado antes de tocarlo (```terraform state pull > backup.json```).
+- ```state push``` sobrescribe el estado remoto entero — si alguien más aplicó cambios mientras tanto, los perderías.
+- Es una herramienta de último recurso, no de uso rutinario. Casi todo lo que "parece" requerir cirugía de estado se resuelve mejor con ```state mv```, ```moved {}```, o ```import```.
+
+
+### 14. Remote Backend (garantías)
+
+Un backend remoto bien configurado ofrece dos garantías clave:
+
+- **Consistencia**: todo el equipo trabaja contra el mismo estado, sin copias divergentes.
+- **Bloqueo (locking)**: mientras alguien está aplicando cambios, nadie más puede iniciar otro apply sobre el mismo estado a la vez, evitando corrupción por escrituras simultáneas.
+
+
+### 15. S3 Backend (patrón estándar en AWS)
+
+El patrón más común para proyectos en AWS es usar S3 como backend, con versionado activado (para poder recuperar estados anteriores si algo sale mal):
+
+```hcl
+resource "aws_s3_bucket" "estado" {
+  bucket = "mi-empresa-terraform-state"
+}
+
+resource "aws_s3_bucket_versioning" "estado" {
+  bucket = aws_s3_bucket.estado.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "estado" {
+  bucket = aws_s3_bucket.estado.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+```
+
+**Nota curiosa**: este bucket que guarda el estado, en sí mismo, normalmente se crea una **única vez** con un ```terraform apply``` local (con backend local), antes de que exista ningún backend remoto al que apuntar — es el clásico problema del "huevo y la gallina" al arrancar un proyecto nuevo.
+
+### 16. DynamoDB Locking
+
+Antes de Terraform 1.10, el bloqueo de estado en el backend S3 requería una tabla DynamoDB separada:
+
+```hcl
+resource "aws_dynamodb_table" "locks" {
+  name         = "terraform-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+```
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "mi-empresa-terraform-state"
+    key            = "app/produccion/terraform.tfstate"
+    region         = "eu-west-1"
+    dynamodb_table = "terraform-locks"  # bloqueo
+    encrypt        = true
+  }
+}
+```
+
+Cómo funciona: al ejecutar ```apply```, Terraform intenta crear un ítem en esta tabla con el ID del estado como clave. Si ya existe (otro ```apply``` en curso), Terraform espera o falla con un error de "state locked", en vez de arriesgarse a una escritura concurrente corrupta.
+
+**Nota de versión**: desde Terraform 1.10+, el backend S3 soporta bloqueo **nativo** usando condiciones de S3, sin necesitar ya una tabla DynamoDB separada — pero encontrarás ```dynamodb_table``` en la inmensa mayoría de proyectos existentes y documentación, por lo que sigue siendo importante entenderlo.
